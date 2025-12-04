@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	stderrors "errors"
+
 	"github.com/spf13/cobra"
 	"github.com/stackitcloud/stackit-cli/internal/cmd/params"
 	"github.com/stackitcloud/stackit-cli/internal/pkg/args"
@@ -29,25 +31,25 @@ import (
 )
 
 const (
-	parentIdFlag          = "parent-id"
-	projectIdLikeFlag     = "project-id-like"
 	memberFlag            = "member"
 	creationTimeAfterFlag = "creation-time-after"
-	limitFlag             = "limit"
-	pageSizeFlag          = "page-size"
+	folderIdFlag          = "folder-id"
+	folderNameFlag        = "folder-name"
+	organizationIdFlag    = "organization-id"
+	organizationNameFlag  = "organization-name"
 
 	creationTimeAfterFormat = time.RFC3339
-	pageSizeDefault         = 50
 )
 
 type inputModel struct {
 	*globalflags.GlobalFlagModel
-	ParentId          *string
-	ProjectIdLike     []string
+	OrganizationId   []string
+	OrganizationName *string
+	FolderId         []string
+	FolderName       *string
+
 	Member            *string
 	CreationTimeAfter *time.Time
-	Limit             *int64
-	PageSize          int64
 	Organization      *string
 }
 
@@ -107,12 +109,12 @@ func NewCmd(params *params.CmdParams) *cobra.Command {
 }
 
 func configureFlags(cmd *cobra.Command) {
-	cmd.Flags().String(parentIdFlag, "", "Filter by parent identifier")
-	cmd.Flags().Var(flags.UUIDSliceFlag(), projectIdLikeFlag, "Filter by project identifier. Multiple project IDs can be provided, but they need to belong to the same parent resource")
+	cmd.Flags().String(organizationNameFlag, "", "Filter by organization name")
+	cmd.Flags().String(folderNameFlag, "", "Filter by folder name")
+	cmd.Flags().Var(flags.UUIDSliceFlag(), folderIdFlag, "Filter by folder identifier. Multiple project IDs can be provided, but they need to belong to the same parent resource")
+	cmd.Flags().Var(flags.UUIDSliceFlag(), organizationIdFlag, "Filter by organization identifier. Multiple project IDs can be provided, but they need to belong to the same parent resource")
 	cmd.Flags().String(memberFlag, "", "Filter by member. The list of projects of which the member is part of will be shown")
 	cmd.Flags().String(creationTimeAfterFlag, "", "Filter by creation timestamp, in a date-time with the RFC3339 layout format, e.g. 2023-01-01T00:00:00Z. The list of projects that were created after the given timestamp will be shown")
-	cmd.Flags().Int64(limitFlag, 0, "Maximum number of entries to list")
-	cmd.Flags().Int64(pageSizeFlag, pageSizeDefault, "Number of items fetched in each API call. Does not affect the number of items in the command output")
 }
 
 func parseInput(p *print.Printer, cmd *cobra.Command, _ []string) (*inputModel, error) {
@@ -126,37 +128,21 @@ func parseInput(p *print.Printer, cmd *cobra.Command, _ []string) (*inputModel, 
 		}
 	}
 
-	limit := flags.FlagToInt64Pointer(p, cmd, limitFlag)
-	if limit != nil && *limit < 1 {
-		return nil, &errors.FlagValidationError{
-			Flag:    limitFlag,
-			Details: "must be greater than 0",
-		}
-	}
-
-	pageSize := flags.FlagWithDefaultToInt64Value(p, cmd, pageSizeFlag)
-	if pageSize < 1 {
-		return nil, &errors.FlagValidationError{
-			Flag:    pageSizeFlag,
-			Details: "must be greater than 0",
-		}
-	}
-
 	model := inputModel{
 		GlobalFlagModel:   globalFlags,
-		ParentId:          flags.FlagToStringPointer(p, cmd, parentIdFlag),
-		ProjectIdLike:     flags.FlagToStringSliceValue(p, cmd, projectIdLikeFlag),
+		OrganizationId:    flags.FlagToStringSliceValue(p, cmd, organizationIdFlag),
+		OrganizationName:  flags.FlagToStringPointer(p, cmd, organizationNameFlag),
+		FolderId:          flags.FlagToStringSliceValue(p, cmd, folderIdFlag),
+		FolderName:        flags.FlagToStringPointer(p, cmd, folderNameFlag),
 		Member:            flags.FlagToStringPointer(p, cmd, memberFlag),
 		CreationTimeAfter: creationTimeAfter,
-		Limit:             limit,
-		PageSize:          pageSize,
 	}
 
 	p.DebugInputModel(model)
 	return &model, nil
 }
 
-func buildMembershipRequest(ctx context.Context, model *inputModel, apiClient *authorization.APIClient) (authorization.ApiListUserMembershipsRequest, error) {
+func getUserMemberships(ctx context.Context, model *inputModel, apiClient *authorization.APIClient) ([]authorization.UserMembership, error) {
 	var member string
 	if model.Member != nil {
 		member = *model.Member
@@ -164,33 +150,38 @@ func buildMembershipRequest(ctx context.Context, model *inputModel, apiClient *a
 		var err error
 		member, err = auth.GetAuthEmail()
 		if err != nil {
-			return authorization.ListUserMembershipsRequest{}, fmt.Errorf("get email of authenticated user: %w", err)
+			return nil, fmt.Errorf("get email of authenticated user: %w", err)
 		}
 	}
 
-	req := apiClient.ListUserMemberships(ctx, member)
-	if model.ParentId != nil {
-		req = req.ParentResourceId(*model.ParentId)
+	resp, err := apiClient.ListUserMemberships(ctx, member).Execute()
+	if err != nil {
+		return nil, err
 	}
-	return req, nil
+	return resp.GetItems(), nil
 }
 
-func getProjectDetails(ctx context.Context, id string, creationTimeAfter *time.Time, client *resourcemanager.APIClient) (*resourcemanager.Project, string, error) {
+type organization struct {
+	Name string
+	Id   string
+}
+
+func getProjectDetails(ctx context.Context, id string, creationTimeAfter *time.Time, client *resourcemanager.APIClient) (*resourcemanager.Project, organization, []resourcemanager.ParentListInner, error) {
 	resp, err := client.GetProject(ctx, id).IncludeParents(true).Execute()
 	if err != nil {
-		return nil, "", err
+		return nil, organization{}, nil, err
 	}
 	if creationTimeAfter != nil {
 		if !resp.CreationTime.After(*creationTimeAfter) {
-			return nil, "", nil
+			return nil, organization{}, nil, nil
 		}
 	}
-	var org string
-	for _, parent := range resp.GetParents() {
-		if parent.GetType() == "ORGANIZATION" {
-			org = parent.GetName()
-		}
+
+	org, err := getOrganizationDetailsFromParents(ctx, resp.GetParents(), client)
+	if err != nil {
+		return nil, org, nil, err
 	}
+
 	return &resourcemanager.Project{
 		ContainerId:    resp.ContainerId,
 		CreationTime:   resp.CreationTime,
@@ -200,21 +191,32 @@ func getProjectDetails(ctx context.Context, id string, creationTimeAfter *time.T
 		Parent:         resp.Parent,
 		ProjectId:      resp.ProjectId,
 		UpdateTime:     resp.UpdateTime,
-	}, org, nil
+	}, org, resp.GetParents(), nil
 }
 
-func getFolderOrganization(ctx context.Context, folderId string, client *resourcemanager.APIClient) (string, error) {
-	resp, err := client.GetFolderDetails(ctx, folderId).IncludeParents(true).Execute()
-	if err != nil {
-		return "", err
-	}
-	var org string
-	for _, parent := range resp.GetParents() {
+func getOrganizationDetailsFromParents(ctx context.Context, parents []resourcemanager.ParentListInner, client *resourcemanager.APIClient) (organization, error) {
+	for _, parent := range parents {
 		if parent.GetType() == "ORGANIZATION" {
-			org = parent.GetName()
+			orgResp, err := client.GetOrganizationExecute(ctx, parent.GetContainerId())
+			if err != nil {
+				return organization{}, err
+			}
+			return organization{
+				Name: orgResp.GetName(),
+				Id:   orgResp.GetOrganizationId(),
+			}, nil
 		}
 	}
-	return org, nil
+	return organization{}, stderrors.New("organization not found")
+}
+
+func getFolderOrganization(ctx context.Context, folderId string, client *resourcemanager.APIClient) (organization, error) {
+	resp, err := client.GetFolderDetails(ctx, folderId).IncludeParents(true).Execute()
+	if err != nil {
+		return organization{}, err
+	}
+
+	return getOrganizationDetailsFromParents(ctx, resp.GetParents(), client)
 }
 
 func getProjectsFromParent(ctx context.Context, parentId string, client *resourcemanager.APIClient) ([]resourcemanager.Project, error) {
@@ -231,7 +233,7 @@ type folderMap struct {
 	cache map[string][]string
 }
 
-func (f folderMap) GetProjectFolderPath(ctx context.Context, p *resourcemanager.Project) ([]string, error) {
+func (f *folderMap) GetProjectFolderPath(ctx context.Context, p *resourcemanager.Project) ([]string, error) {
 	parent := p.GetParent()
 	if parent.GetType() != "FOLDER" {
 		return []string{}, nil
@@ -250,7 +252,7 @@ func (f folderMap) GetProjectFolderPath(ctx context.Context, p *resourcemanager.
 	return folderpath, nil
 }
 
-func (f folderMap) getProjectFolderPath(ctx context.Context, parentId string) ([]string, error) {
+func (f *folderMap) getProjectFolderPath(ctx context.Context, parentId string) ([]string, error) {
 	resp, err := f.c.GetFolderDetails(ctx, parentId).IncludeParents(true).Execute()
 	if err != nil {
 		return nil, err
@@ -282,28 +284,68 @@ type projectInOrgs struct {
 	state map[string]map[string]projectInfo
 	fmap  folderMap
 
+	folderFilters      []func(*resourcemanager.GetFolderDetailsResponse) bool
+	organizationFilter []func(organization) bool
+
 	model                 *inputModel
 	resourcemanagerClient *resourcemanager.APIClient
 }
 
 func (o *projectInOrgs) processProject(ctx context.Context, item *authorization.UserMembership) error {
-	proj, org, err := getProjectDetails(ctx, *item.ResourceId, o.model.CreationTimeAfter, o.resourcemanagerClient)
+	proj, org, parents, err := getProjectDetails(ctx, *item.ResourceId, o.model.CreationTimeAfter, o.resourcemanagerClient)
 	if err != nil {
 		return err
 	}
 	if proj == nil {
 		return nil
 	}
+
+	for _, filter := range o.organizationFilter {
+		if filter(org) {
+			return nil
+		}
+	}
+	if len(o.folderFilters) != 0 {
+		p, ok := proj.GetParentOk()
+		// folder filters are set, but no parent
+		if !ok {
+			return nil
+		}
+		// folder filters are set, but the parent is not a folder, so sort out every time
+		if p.GetType() != "FOLDER" {
+			return nil
+		}
+
+		var found bool
+		for _, parent := range parents {
+			if parent.GetType() != "FOLDER" {
+				continue
+			}
+			details, err := o.resourcemanagerClient.GetFolderDetails(ctx, parent.GetId()).Execute()
+			if err != nil {
+				return err
+			}
+			for _, filter := range o.folderFilters {
+				if !filter(details) {
+					found = true
+				}
+			}
+		}
+		if !found {
+			return nil
+		}
+	}
+
 	folderPath, err := o.fmap.GetProjectFolderPath(ctx, proj)
 	if err != nil {
 		return err
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	orgMap, ok := o.state[org]
+	orgMap, ok := o.state[org.Name]
 	if !ok {
-		o.state[org] = map[string]projectInfo{}
-		orgMap = o.state[org]
+		o.state[org.Name] = map[string]projectInfo{}
+		orgMap = o.state[org.Name]
 	}
 	if _, ok := orgMap[proj.GetProjectId()]; !ok {
 		orgMap[proj.GetProjectId()] = projectInfo{
@@ -315,20 +357,59 @@ func (o *projectInOrgs) processProject(ctx context.Context, item *authorization.
 }
 
 func (o *projectInOrgs) processFolder(ctx context.Context, item *authorization.UserMembership) error {
+	if len(o.folderFilters) != 0 {
+		details, err := o.resourcemanagerClient.GetFolderDetails(ctx, item.GetResourceId()).IncludeParents(true).Execute()
+		if err != nil {
+			return err
+		}
+		// Sort out folder
+		allFolderDetails := make([]*resourcemanager.GetFolderDetailsResponse, 0, 1+len(details.GetParents()))
+		allFolderDetails = append(allFolderDetails, details)
+		for _, parent := range details.GetParents() {
+			if parent.GetType() != "FOLDER" {
+				continue
+			}
+			details, err := o.resourcemanagerClient.GetFolderDetails(ctx, parent.GetId()).Execute()
+			if err != nil {
+				return err
+			}
+			allFolderDetails = append(allFolderDetails, details)
+		}
+		var found bool
+		for _, d := range allFolderDetails {
+			for _, filter := range o.folderFilters {
+				if !filter(d) {
+					found = true
+				}
+			}
+		}
+		if !found {
+			return nil
+		}
+	}
+
 	org, err := getFolderOrganization(ctx, item.GetResourceId(), o.resourcemanagerClient)
 	if err != nil {
 		return err
 	}
+
+	// Sort out org
+	for _, filter := range o.organizationFilter {
+		if filter(org) {
+			return nil
+		}
+	}
+
 	projects, err := getProjectsFromParent(ctx, item.GetResourceId(), o.resourcemanagerClient)
 	if err != nil {
 		return err
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	orgMap, ok := o.state[org]
+	orgMap, ok := o.state[org.Name]
 	if !ok {
-		o.state[org] = map[string]projectInfo{}
-		orgMap = o.state[org]
+		o.state[org.Name] = map[string]projectInfo{}
+		orgMap = o.state[org.Name]
 	}
 	for _, proj := range projects {
 		folderPath, err := o.fmap.GetProjectFolderPath(ctx, &proj)
@@ -358,19 +439,37 @@ func (o *projectInOrgs) AsSortedSlice() map[string][]projectInfo {
 	return infoMap
 }
 
-func fetchProjects(ctx context.Context, model *inputModel, authorizationClient *authorization.APIClient, resourcemanagerClient *resourcemanager.APIClient) (map[string][]projectInfo, error) {
-	if model.Limit != nil && *model.Limit < model.PageSize {
-		model.PageSize = *model.Limit
+func organizationFiltersFromModel(model *inputModel) []func(organization) bool {
+	filters := []func(organization) bool{}
+	if len(model.OrganizationId) != 0 {
+		filters = append(filters, func(o organization) bool {
+			return !slices.Contains(model.OrganizationId, o.Id)
+		})
 	}
-	req, err := buildMembershipRequest(ctx, model, authorizationClient)
-	if err != nil {
-		return nil, err
+	if model.OrganizationName != nil {
+		filters = append(filters, func(o organization) bool {
+			return o.Name != *model.OrganizationName
+		})
 	}
-	resp, err := req.Execute()
-	if err != nil {
-		return nil, err
-	}
+	return filters
+}
 
+func folderFiltersFromModel(model *inputModel) []func(*resourcemanager.GetFolderDetailsResponse) bool {
+	filters := []func(*resourcemanager.GetFolderDetailsResponse) bool{}
+	if len(model.FolderId) != 0 {
+		filters = append(filters, func(r *resourcemanager.GetFolderDetailsResponse) bool {
+			return !slices.Contains(model.FolderId, r.GetFolderId())
+		})
+	}
+	if model.FolderName != nil {
+		filters = append(filters, func(r *resourcemanager.GetFolderDetailsResponse) bool {
+			return r.GetName() != *model.FolderName
+		})
+	}
+	return filters
+}
+
+func fetchProjects(ctx context.Context, model *inputModel, authorizationClient *authorization.APIClient, resourcemanagerClient *resourcemanager.APIClient) (map[string][]projectInfo, error) {
 	projectOrgMap := projectInOrgs{
 		resourcemanagerClient: resourcemanagerClient,
 		state:                 map[string]map[string]projectInfo{},
@@ -378,10 +477,18 @@ func fetchProjects(ctx context.Context, model *inputModel, authorizationClient *
 			cache: map[string][]string{},
 			c:     resourcemanagerClient,
 		},
-		model: model,
+		model:              model,
+		folderFilters:      folderFiltersFromModel(model),
+		organizationFilter: organizationFiltersFromModel(model),
 	}
+
+	memberships, err := getUserMemberships(ctx, model, authorizationClient)
+	if err != nil {
+		return nil, err
+	}
+
 	g := new(errgroup.Group)
-	for _, item := range resp.GetItems() {
+	for _, item := range memberships {
 		if item.ResourceId == nil {
 			continue
 		}
