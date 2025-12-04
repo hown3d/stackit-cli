@@ -1,8 +1,13 @@
 package list
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"maps"
+	"path"
+	"slices"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -14,10 +19,13 @@ import (
 	"github.com/stackitcloud/stackit-cli/internal/pkg/flags"
 	"github.com/stackitcloud/stackit-cli/internal/pkg/globalflags"
 	"github.com/stackitcloud/stackit-cli/internal/pkg/print"
-	"github.com/stackitcloud/stackit-cli/internal/pkg/services/resourcemanager/client"
+	authorizationclient "github.com/stackitcloud/stackit-cli/internal/pkg/services/authorization/client"
+	resourcemanagerclient "github.com/stackitcloud/stackit-cli/internal/pkg/services/resourcemanager/client"
 	"github.com/stackitcloud/stackit-cli/internal/pkg/tables"
 	"github.com/stackitcloud/stackit-cli/internal/pkg/utils"
+	"github.com/stackitcloud/stackit-sdk-go/services/authorization"
 	"github.com/stackitcloud/stackit-sdk-go/services/resourcemanager"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -40,6 +48,7 @@ type inputModel struct {
 	CreationTimeAfter *time.Time
 	Limit             *int64
 	PageSize          int64
+	Organization      *string
 }
 
 func NewCmd(params *params.CmdParams) *cobra.Command {
@@ -70,13 +79,18 @@ func NewCmd(params *params.CmdParams) *cobra.Command {
 			}
 
 			// Configure API client
-			apiClient, err := client.ConfigureClient(params.Printer, params.CliVersion)
+			authorizationClient, err := authorizationclient.ConfigureClient(params.Printer, params.CliVersion)
+			if err != nil {
+				return err
+			}
+
+			resourcemanagerClient, err := resourcemanagerclient.ConfigureClient(params.Printer, params.CliVersion)
 			if err != nil {
 				return err
 			}
 
 			// Fetch projects
-			projects, err := fetchProjects(ctx, model, apiClient)
+			projects, err := fetchProjects(ctx, model, authorizationClient, resourcemanagerClient)
 			if err != nil {
 				return err
 			}
@@ -142,91 +156,272 @@ func parseInput(p *print.Printer, cmd *cobra.Command, _ []string) (*inputModel, 
 	return &model, nil
 }
 
-func buildRequest(ctx context.Context, model *inputModel, apiClient resourceManagerClient, offset int) (resourcemanager.ApiListProjectsRequest, error) {
-	req := apiClient.ListProjects(ctx)
-	if model.ParentId != nil {
-		req = req.ContainerParentId(*model.ParentId)
-	}
-	if model.ProjectIdLike != nil {
-		req = req.ContainerIds(model.ProjectIdLike)
-	}
+func buildMembershipRequest(ctx context.Context, model *inputModel, apiClient *authorization.APIClient) (authorization.ApiListUserMembershipsRequest, error) {
+	var member string
 	if model.Member != nil {
-		req = req.Member(*model.Member)
-	}
-	if model.CreationTimeAfter != nil {
-		req = req.CreationTimeStart(*model.CreationTimeAfter)
+		member = *model.Member
+	} else {
+		var err error
+		member, err = auth.GetAuthEmail()
+		if err != nil {
+			return authorization.ListUserMembershipsRequest{}, fmt.Errorf("get email of authenticated user: %w", err)
+		}
 	}
 
-	if model.ParentId == nil && model.ProjectIdLike == nil && model.Member == nil {
-		email, err := auth.GetAuthEmail()
-		if err != nil {
-			return req, fmt.Errorf("get email of authenticated user: %w", err)
-		}
-		req = req.Member(email)
+	req := apiClient.ListUserMemberships(ctx, member)
+	if model.ParentId != nil {
+		req = req.ParentResourceId(*model.ParentId)
 	}
-	req = req.Limit(float32(model.PageSize))
-	req = req.Offset(float32(offset))
 	return req, nil
 }
 
-type resourceManagerClient interface {
-	ListProjects(ctx context.Context) resourcemanager.ApiListProjectsRequest
+func getProjectDetails(ctx context.Context, id string, creationTimeAfter *time.Time, client *resourcemanager.APIClient) (*resourcemanager.Project, string, error) {
+	resp, err := client.GetProject(ctx, id).IncludeParents(true).Execute()
+	if err != nil {
+		return nil, "", err
+	}
+	if creationTimeAfter != nil {
+		if !resp.CreationTime.After(*creationTimeAfter) {
+			return nil, "", nil
+		}
+	}
+	var org string
+	for _, parent := range resp.GetParents() {
+		if parent.GetType() == "ORGANIZATION" {
+			org = parent.GetName()
+		}
+	}
+	return &resourcemanager.Project{
+		ContainerId:    resp.ContainerId,
+		CreationTime:   resp.CreationTime,
+		Labels:         resp.Labels,
+		LifecycleState: resp.LifecycleState,
+		Name:           resp.Name,
+		Parent:         resp.Parent,
+		ProjectId:      resp.ProjectId,
+		UpdateTime:     resp.UpdateTime,
+	}, org, nil
 }
 
-func fetchProjects(ctx context.Context, model *inputModel, apiClient resourceManagerClient) ([]resourcemanager.Project, error) {
+func getFolderOrganization(ctx context.Context, folderId string, client *resourcemanager.APIClient) (string, error) {
+	resp, err := client.GetFolderDetails(ctx, folderId).IncludeParents(true).Execute()
+	if err != nil {
+		return "", err
+	}
+	var org string
+	for _, parent := range resp.GetParents() {
+		if parent.GetType() == "ORGANIZATION" {
+			org = parent.GetName()
+		}
+	}
+	return org, nil
+}
+
+func getProjectsFromParent(ctx context.Context, parentId string, client *resourcemanager.APIClient) ([]resourcemanager.Project, error) {
+	resp, err := client.ListProjects(ctx).ContainerParentId(parentId).Execute()
+	if err != nil {
+		return nil, err
+	}
+	return resp.GetItems(), nil
+}
+
+type folderMap struct {
+	mu    sync.Mutex
+	c     *resourcemanager.APIClient
+	cache map[string][]string
+}
+
+func (f folderMap) GetProjectFolderPath(ctx context.Context, p *resourcemanager.Project) ([]string, error) {
+	parent := p.GetParent()
+	if parent.GetType() != "FOLDER" {
+		return []string{}, nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	folderpath, ok := f.cache[parent.GetContainerId()]
+	if !ok {
+		var err error
+		folderpath, err = f.getProjectFolderPath(ctx, parent.GetContainerId())
+		if err != nil {
+			return nil, err
+		}
+		f.cache[parent.GetContainerId()] = folderpath
+	}
+	return folderpath, nil
+}
+
+func (f folderMap) getProjectFolderPath(ctx context.Context, parentId string) ([]string, error) {
+	resp, err := f.c.GetFolderDetails(ctx, parentId).IncludeParents(true).Execute()
+	if err != nil {
+		return nil, err
+	}
+	folderpath := []string{resp.GetName()}
+	for _, parent := range resp.GetParents() {
+		// TODO: check if this is always returned sorted
+		if parent.GetType() != "FOLDER" {
+			break
+		}
+		folderpath = append([]string{parent.GetName()}, folderpath...)
+	}
+	return folderpath, nil
+}
+
+type projectInfo struct {
+	resourcemanager.Project
+	FolderPath folderPath
+}
+
+type folderPath []string
+
+func (f folderPath) String() string {
+	return path.Join(f...)
+}
+
+type projectInOrgs struct {
+	mu    sync.Mutex
+	state map[string]map[string]projectInfo
+	fmap  folderMap
+
+	model                 *inputModel
+	resourcemanagerClient *resourcemanager.APIClient
+}
+
+func (o *projectInOrgs) processProject(ctx context.Context, item *authorization.UserMembership) error {
+	proj, org, err := getProjectDetails(ctx, *item.ResourceId, o.model.CreationTimeAfter, o.resourcemanagerClient)
+	if err != nil {
+		return err
+	}
+	if proj == nil {
+		return nil
+	}
+	folderPath, err := o.fmap.GetProjectFolderPath(ctx, proj)
+	if err != nil {
+		return err
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	orgMap, ok := o.state[org]
+	if !ok {
+		o.state[org] = map[string]projectInfo{}
+		orgMap = o.state[org]
+	}
+	if _, ok := orgMap[proj.GetProjectId()]; !ok {
+		orgMap[proj.GetProjectId()] = projectInfo{
+			Project:    *proj,
+			FolderPath: folderPath,
+		}
+	}
+	return nil
+}
+
+func (o *projectInOrgs) processFolder(ctx context.Context, item *authorization.UserMembership) error {
+	org, err := getFolderOrganization(ctx, item.GetResourceId(), o.resourcemanagerClient)
+	if err != nil {
+		return err
+	}
+	projects, err := getProjectsFromParent(ctx, item.GetResourceId(), o.resourcemanagerClient)
+	if err != nil {
+		return err
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	orgMap, ok := o.state[org]
+	if !ok {
+		o.state[org] = map[string]projectInfo{}
+		orgMap = o.state[org]
+	}
+	for _, proj := range projects {
+		folderPath, err := o.fmap.GetProjectFolderPath(ctx, &proj)
+		if err != nil {
+			return err
+		}
+		if _, ok := orgMap[proj.GetProjectId()]; !ok {
+			orgMap[proj.GetProjectId()] = projectInfo{
+				Project:    proj,
+				FolderPath: folderPath,
+			}
+		}
+	}
+	return nil
+}
+
+// AsSortedSlice returns the projectInfos sorted by folderPath
+func (o *projectInOrgs) AsSortedSlice() map[string][]projectInfo {
+	infoMap := make(map[string][]projectInfo, len(o.state))
+	for org, m := range o.state {
+		infos := slices.Collect(maps.Values(m))
+		slices.SortFunc(infos, func(a, b projectInfo) int {
+			return cmp.Compare(a.FolderPath.String(), b.FolderPath.String())
+		})
+		infoMap[org] = infos
+	}
+	return infoMap
+}
+
+func fetchProjects(ctx context.Context, model *inputModel, authorizationClient *authorization.APIClient, resourcemanagerClient *resourcemanager.APIClient) (map[string][]projectInfo, error) {
 	if model.Limit != nil && *model.Limit < model.PageSize {
 		model.PageSize = *model.Limit
 	}
-
-	offset := 0
-	projects := []resourcemanager.Project{}
-	for {
-		// Call API
-		req, err := buildRequest(ctx, model, apiClient, offset)
-		if err != nil {
-			return nil, fmt.Errorf("build list projects request: %w", err)
-		}
-		resp, err := req.Execute()
-		if err != nil {
-			return nil, fmt.Errorf("get projects: %w", err)
-		}
-		respProjects := *resp.Items
-		if len(respProjects) == 0 {
-			break
-		}
-		projects = append(projects, respProjects...)
-		// Stop if no more pages
-		if len(respProjects) < int(model.PageSize) {
-			break
-		}
-
-		// Stop and truncate if limit is reached
-		if model.Limit != nil && len(projects) >= int(*model.Limit) {
-			projects = projects[:*model.Limit]
-			break
-		}
-		offset += int(model.PageSize)
+	req, err := buildMembershipRequest(ctx, model, authorizationClient)
+	if err != nil {
+		return nil, err
 	}
-	return projects, nil
+	resp, err := req.Execute()
+	if err != nil {
+		return nil, err
+	}
+
+	projectOrgMap := projectInOrgs{
+		resourcemanagerClient: resourcemanagerClient,
+		state:                 map[string]map[string]projectInfo{},
+		fmap: folderMap{
+			cache: map[string][]string{},
+			c:     resourcemanagerClient,
+		},
+		model: model,
+	}
+	g := new(errgroup.Group)
+	for _, item := range resp.GetItems() {
+		if item.ResourceId == nil {
+			continue
+		}
+		switch *item.ResourceType {
+		case "project":
+			g.Go(func() error {
+				return projectOrgMap.processProject(ctx, &item)
+			})
+		case "folder":
+			g.Go(func() error {
+				return projectOrgMap.processFolder(ctx, &item)
+			})
+		}
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	return projectOrgMap.AsSortedSlice(), nil
 }
 
-func outputResult(p *print.Printer, outputFormat string, projects []resourcemanager.Project) error {
-	return p.OutputResult(outputFormat, projects, func() error {
+func outputResult(p *print.Printer, outputFormat string, projectInfos map[string][]projectInfo) error {
+	return p.OutputResult(outputFormat, projectInfos, func() error {
 		table := tables.NewTable()
-		table.SetHeader("ID", "NAME", "STATE", "PARENT ID")
-		for i := range projects {
-			p := projects[i]
-
-			var parentId *string
-			if p.Parent != nil {
-				parentId = p.Parent.Id
+		table.SetHeader("ID", "ORGANIZATION", "FOLDER", "NAME", "STATE", "PARENT ID")
+		for org, projects := range projectInfos {
+			for _, p := range projects {
+				var parentId *string
+				if p.Parent != nil {
+					parentId = p.Parent.Id
+				}
+				table.AddRow(
+					utils.PtrString(p.ProjectId),
+					org,
+					p.FolderPath,
+					utils.PtrString(p.Name),
+					utils.PtrString(p.LifecycleState),
+					utils.PtrString(parentId),
+				)
 			}
-			table.AddRow(
-				utils.PtrString(p.ProjectId),
-				utils.PtrString(p.Name),
-				utils.PtrString(p.LifecycleState),
-				utils.PtrString(parentId),
-			)
 		}
 
 		err := table.Display(p)
